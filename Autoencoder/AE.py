@@ -11,13 +11,16 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 import datetime
 
+data_directory = '/home/b.mcr/M2M/code/IPXanalyzer/data/'
+directory = '/home/b.mcr/M2M/code/IPXanalyzer/'
+
 # Define parameters
-num_epochs = 100
-batch_size = 256
+num_epochs = 200
+batch_size = 512
 learning_rate = 1e-6
 weight_decay = 1e-5
-z_dims = 100
 h1_dims = 1000
+z_dims = 100
 kld_coef = 1
 
 SEED = 1
@@ -32,17 +35,9 @@ if CUDA:
 
 # Define Tensorboard location and plot names
 now = datetime.datetime.now()
-location = 'runs/' + now.strftime("%m-%d-%H:%M") + 'z' + str(num_epochs) + 'b' + str(batch_size) + 'lr' + \
-           str(learning_rate) + 'w' + str(weight_decay)
+location = directory + 'runs/' + now.strftime("%m-%d-%H:%M") + 'z' + str(num_epochs) + 'b' + str(batch_size) + 'lr' + \
+           str(learning_rate) + 'w' + str(weight_decay) + '2days'
 writer = SummaryWriter(location)
-
-
-# Create dummy df for debugging
-
-# dataset = pd.read_csv("one_hot_df.csv", sep=',', index_col=0)
-# dataset.loc[:, ~dataset.columns.str.contains('^Unnamed')]
-# dummy_df = dataset[:batch_size]
-# dummy_df.to_csv('dummy_df.csv', index=False)
 
 
 # --------------------------------------------- FUNCTIONS -------------------------------------------------------------
@@ -75,7 +70,7 @@ class Autoencoder(nn.Module):
 
     def encode(self, x):
         # h1 is [batch_size, 10000]
-        h1 = F.relu(self.fc1(x))  # type: Variable
+        h1 = F.relu(self.fc1(x))
         return self.fc21(h1), self.fc22(h1)
 
     def decode(self, z):
@@ -96,11 +91,7 @@ class Autoencoder(nn.Module):
 
         """
         std = logvar.mul(0.5).exp_()
-        if torch.cuda.is_available():
-            eps = torch.cuda.FloatTensor(std.size()).normal_()
-        else:
-            eps = torch.FloatTensor(std.size()).normal_()
-        eps = Variable(eps)
+        eps = torch.FloatTensor(std.size()).normal_()
         return eps.mul(std).add_(mu)
 
     def get_z(self, x):
@@ -125,8 +116,6 @@ def loss_function(recon_x, x, mu, logvar, kld_coef=1):
     """
     BCE = F.binary_cross_entropy(recon_x, x)  # reduction='sum'
 
-    #   KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-
     # loss = 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
     KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
     KLD = torch.sum(KLD_element).mul_(-0.5)
@@ -139,7 +128,7 @@ def loss_function(recon_x, x, mu, logvar, kld_coef=1):
 
 # --------------------------------------------------- TRAIN -----------------------------------------------------------
 
-def train(dataloader, ae, epoch, i):
+def train(dataloader, ae, epoch):
 
     # toggle model to train mode
     ae.train()
@@ -162,23 +151,22 @@ def train(dataloader, ae, epoch, i):
         # Get latent space z
         z = ae.reparametrize(mu, logvar)
 
+        # Print loss
         # if (i + 1) % 100 == 0:
-        #    print('Epoch [%d/%d], Iter [%d] Loss: %.4f ' % ( epoch + 1, num_epochs, i + 1, loss.item()))
+        #    print('Epoch [%d/%d], Loss: %.4f ' % ( epoch + 1, num_epochs, loss.item()))
 
-        # Tensorboard Logging
+        # Tensorboard Logging - loss per batch
         writer.add_scalar('loss_epoch', loss.item(), epoch)
-        writer.add_scalar('BCE_i', BCE.item(), i)
-        writer.add_scalar('KLD_i', KLD_loss.item(), i)
+        writer.add_scalar('BCE_epoch', BCE.item(), epoch)
+        writer.add_scalar('KLD_epoch', KLD_loss.item(), epoch)
         writer.add_histogram('hist', z, epoch)
-
-        i += 1
-    return i
 
 
 # --------------------------------------------- LOAD DATA -------------------------------------------------------------
 
-
-dataset = pd.read_csv("one_hot_df.csv", sep=',', index_col=0)
+print(' Reading data...')
+# dataset = pd.read_csv(data_directory + "one_hot_df.csv", sep=',', index_col=0)
+dataset = pd.read_hdf(data_directory + 'one_hot_df.h5')
 
 # Split data
 train_df, dev_df, test_df = split_data(dataset)
@@ -190,9 +178,6 @@ print(dataset.head(5))
 
 N = dataset.shape[0]  # num of logs
 D = dataset.shape[1]  # sequence length
-
-print('We have %s observations with %s dimensions' % (N, D))
-# We have 40110 observations with 14804 dimensions
 
 # Converting the data into Torch tensors
 training_set = torch.tensor(training_set, dtype=torch.float)
@@ -206,23 +191,37 @@ dataloader = DataLoader(data_train, batch_size=batch_size, shuffle=False)
 
 iter_per_epoch = len(dataloader)
 data_iter = iter(dataloader)
-print("iter_per_epoch: ", iter_per_epoch)
+
+print(" -------------- DATA --------------")
+print('Observations: ', N)
+print('Dimensions: ', D)
+print('Number of batches: ', num_batches)
+print("iterations per epoch: ", iter_per_epoch)
 
 # --------------------------------------------------- INIT -----------------------------------------------------------
 
+print(" -------------- AUTOENCODER --------------")
 # Instantiate and init the model, and move it to the GPU
 ae = Autoencoder(input_size=D).cuda()
 print(ae)
 
+print(" -------------- PARAMETERS --------------")
+print('num epochs: ', num_epochs)
+print('batch size: ', batch_size)
+print('learning_rate: ', learning_rate)
+print('weight_decay: ', weight_decay)
+print('h1_dims: ', h1_dims)
+print('z_dims: ', z_dims)
+print('kld_coef: ', kld_coef)
+print(" -----------------------------------------")
+
 # Define optimizer
 optimizer = torch.optim.Adam(ae.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
-# Iterations
-i = 0
-
+# Training loop epochs
 for epoch in tqdm(range(num_epochs)):
 
-    i = train(dataloader, ae, epoch, i)
+    train(dataloader, ae, epoch)
 
 writer.close()
 
