@@ -8,8 +8,8 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 import datetime
 
-data_directory = '/home/b.mcr/M2M/code/IPXanalyzer/data/'
-directory = '/home/b.mcr/M2M/code/IPXanalyzer/'
+data_directory = '/data/'
+directory = ''
 
 # Define parameters
 num_epochs = 100
