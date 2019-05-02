@@ -2,34 +2,34 @@
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
-import torch.nn.functional as F  # layers, activations and more
 from tqdm import tqdm
 from tensorboardX import SummaryWriter
 import datetime
 import pickle
 import random
 import json
+import numpy as np
+from utils import split_data, split_tensor, save_checkpoint
 
-data_directory = 'data/'
-directory = ''
-
-# Define parameters
-num_epochs = 100
-batch_size = 128
-learning_rate = 1e-6
-weight_decay = 1e-5
-h1_dims = 240
-z_dims = 100
-kld_coef = 1
+data_directory = '/home/b.mcr/M2M/data/'
+directory = '/home/b.mcr/M2M/'
 
 # Embeddings -  test different values
 embedding_dim_imsi = 200
-embedding_dim_day = 10
+embedding_dim_day = 5
 embedding_dim_hour = 10
 embedding_dim_msgid = 10
 embedding_dim_op = 10
 # total embeddings = 200 + 10 + 10 + 10 + 10 = 240
+
+# Define parameters
+num_epochs = 300
+batch_size = 128
+learning_rate = 1e-6
+weight_decay = 1e-5
+z_dims = 100
+kld_coef = 1
+h1_dims = embedding_dim_imsi + embedding_dim_day + embedding_dim_hour + embedding_dim_msgid + embedding_dim_op
 
 day_size = 2
 hour_size = 24
@@ -38,7 +38,6 @@ op_size = 3
 
 SEED = 1
 
-# CUDA
 CUDA = torch.cuda.is_available()
 print("Cuda available", torch.cuda.is_available())
 
@@ -62,11 +61,18 @@ def main():
 
     print(' Reading data...')
     dataset = pickle.load(open(data_directory + "encoded_data_list.pickle", "rb"))
- 
-    mapping_IMIS = json.load(open(data_directory + "mapping_imsi_to_ordinal_id.json", "rb"))
+    # All data: 14.111.573
+
+    # dataset = dataset[:100000]
+    print('Dataset size: ', len(dataset))
+    # pickle.dump(dataset, open(data_directory + 'encoded_data_small.pickle', "wb"))
+    # print('First data row: ', dataset[0])
+
+    # Load mapping IMSIS to ordinals
+    mapping_IMSI = json.load(open(data_directory + "mapping_imsi_to_ordinal_id.json", "rb"))
 
     # Number of different imsis
-    imsis_vocab_size = len(mapping_IMIS)
+    imsis_vocab_size = len(mapping_IMSI)
 
     # Shuffle data
     random.seed(1)
@@ -81,29 +87,60 @@ def main():
 
     # Converting the data into Torch tensors
     data_train = torch.LongTensor(training_set)
+    data_val = torch.LongTensor(dev_set)
 
     # Make batches
     num_batches = data_train.size(0) // batch_size  # Get number of batches
     data_train = data_train[:num_batches * batch_size]  # Trim last elements
     data_train = data_train.view(-1, batch_size, D)  # Reshape
 
+    num_batches_val = data_val.size(0) // batch_size
+    data_val = data_val[:num_batches_val * batch_size]
+    data_val = data_val.view(-1, batch_size, D)
 
+    # Define data loader: iterator over the dataset
+    # dataloader = DataLoader(data_train, batch_size=batch_size, shuffle=False)
+    # iter_per_epoch = len(dataloader)
+    # data_iter = iter(dataloader)
+
+    print('')
     print(" ------------------ DATA -----------------")
     print('Observations: ', N)
     print('Dimensions/columns: ', D)
     print('Number of batches: ', num_batches)
     print('imsis_vocab_size: ', imsis_vocab_size)
 
-    # print("iterations per epoch: ", iter_per_epoch)
+    # --------------------------------------------- INIT MODEL -------------------------------------------------------
 
-    # ------------------------------------------------ INIT ------------------------------------------------------------
+    # print(" -------------- AUTOENCODER --------------")
 
-    print(" -------------- AUTOENCODER --------------")
+    checkpoint = 'BEST_checkpoint_04-26-22:50z100b128lr1e-06w1e-05.pth.tar'
+    start_epoch = 0
 
-    # Instantiate and init the model, and move it to the GPU
-    ae = Autoencoder(input_size=D, imsis_size=imsis_vocab_size).cuda()
-    print(ae)
+    # Initialize / load checkpoint
+    if checkpoint is None:
 
+        # Instantiate and init the model, and move it to the GPU
+        encoder = Encoder(imsis_size=imsis_vocab_size).cuda()
+        decoder = Decoder(imsis_size=imsis_vocab_size).cuda()
+
+        # Define optimizers
+        encoder_optimizer = torch.optim.Adam(encoder.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        decoder_optimizer = torch.optim.Adam(decoder.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+    else:
+        print('Loading checkpoint...')
+
+        # Load the model, and move it to the GPU
+        checkpoint = torch.load(checkpoint, map_location={'cuda:0': 'cpu'})
+        start_epoch = checkpoint['epoch'] + 1
+        decoder = checkpoint['decoder'].cuda()
+        decoder_optimizer = checkpoint['decoder_optimizer']
+        encoder = checkpoint['encoder'].cuda()
+        encoder_optimizer = checkpoint['encoder_optimizer']
+        print('Start epoch: ', start_epoch)
+
+    print('')
     print(" --------------- PARAMETERS --------------")
     print('num epochs: ', num_epochs)
     print('batch size: ', batch_size)
@@ -112,26 +149,47 @@ def main():
     print('h1_dims: ', h1_dims)
     print('z_dims: ', z_dims)
     print('kld_coef: ', kld_coef)
-
+    print('')
     print(" ------------- TRAINING LOOP -------------")
 
-    # Define optimizer
-    optimizer = torch.optim.Adam(ae.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    epochs_since_improvement = 0
+    best_loss = np.inf
 
-    # Training loop epochs
-    for epoch in tqdm(range(num_epochs)):
-        loss, CE, KLD, losses = train(data_train, ae, optimizer, epoch)
+    ############################################### TRAINING LOOP ##################################################
+
+    for epoch in tqdm(range(start_epoch, num_epochs)):
+
+        # Decay learning rate if there is no improvement for 8 consecutive epochs, and terminate training after 20
+        # if epochs_since_improvement == 40:
+        #     break
+
+        # One epoch's training
+        avg_loss, loss, CE, KLD, losses, z = train(data_train, encoder, decoder, encoder_optimizer, decoder_optimizer, epoch)
+
+        # One epoch's validation
+        loss_val = validate(data_val, encoder, decoder)
 
         # Check if there was an improvement
-        # is_best = loss > best_loss
-        # best_loss = max(loss, best_loss)
+        is_best = loss_val < best_loss
+        best_loss = min(loss_val, best_loss)
 
-        save_checkpoint(name, epoch, ae, optimizer, is_best=True)
+        if not is_best:
+            epochs_since_improvement += 1
+            print("\nEpochs since last improvement: %d\n" % (epochs_since_improvement,))
+        else:
+            epochs_since_improvement = 0
+
+        # Save model
+        save_checkpoint(name, epoch, epochs_since_improvement, encoder, decoder, encoder_optimizer,
+                        decoder_optimizer, is_best)
 
         # Tensorboard Logging - loss per batch
-        writer.add_scalar('Loss', loss.item(), epoch)
+        writer.add_scalar('Training Loss', loss.item(), epoch)
+        writer.add_scalar('Avg Training Loss', avg_loss.item(), epoch)
         writer.add_scalar('Cross Entropy Loss', CE.item(), epoch)
         writer.add_scalar('KLD', KLD.item(), epoch)
+        writer.add_scalar('loss_val', loss_val, epoch)
+
         # writer.add_histogram('hist', z, epoch)
 
         # Plot imsi, day, hour, msgid, opcode losses separately
@@ -139,27 +197,16 @@ def main():
         writer.add_scalar('Day loss', losses[1].item(), epoch)
         writer.add_scalar('Hour loss', losses[2].item(), epoch)
         writer.add_scalar('Msg Id loss', losses[3].item(), epoch)
-        writer.add_scalar('Pp code loss', losses[4].item(), epoch)
+        writer.add_scalar('Op code loss', losses[4].item(), epoch)
 
     writer.close()
 
 
-# --------------------------------------------- FUNCTIONS -------------------------------------------------------------
+# ----------------------------------------------- MODEL -------------------------------------------------------
 
-
-def split_data(data_list):
-    split_1 = int(0.8 * len(data_list))
-    split_2 = int(0.9 * len(data_list))
-    train_d = data_list[0:split_1]
-    dev = data_list[split_1:split_2]
-    test = data_list[split_2:]
-
-    return train_d, dev, test
-
-
-class Autoencoder(nn.Module):
-    def __init__(self, input_size=None, imsis_size=None):
-        super(Autoencoder, self).__init__()
+class Encoder(nn.Module):
+    def __init__(self, imsis_size=None):
+        super(Encoder, self).__init__()
 
         # EMBEDDINGS this layer will map each imsi,day,etc to a feature space of size hidden_size
         self.embed_imsi = nn.Embedding(imsis_size, embedding_dim_imsi)  # vocabulary size, dimensionality
@@ -174,17 +221,16 @@ class Autoencoder(nn.Module):
         self.fc22 = nn.Linear(h1_dims, z_dims)
         self.relu = nn.ReLU()
 
-        # DECODER
-        self.fc3 = nn.Linear(z_dims, h1_dims)
-        self.fc4 = nn.Linear(h1_dims, imsis_size + day_size + hour_size + op_size + msgid_size)
-        self.sigmoid = nn.Sigmoid()
-
     def embedding(self, x):
-        imsi_embed = self.embed_imsi(x[:, 0])
-        day_embed = self.embed_day(x[:, 1])
-        hour_embed = self.embed_hour(x[:, 2])
-        msgid_embed = self.embed_msgid(x[:, 3])
-        op_embed = self.embed_op(x[:, 4])
+
+        if len(x.size()) > 1:
+            imsi_embed = self.embed_imsi(x[:, 0])
+            day_embed = self.embed_day(x[:, 1])
+            hour_embed = self.embed_hour(x[:, 2])
+            msgid_embed = self.embed_msgid(x[:, 3])
+            op_embed = self.embed_op(x[:, 4])
+
+            embed_tensor = torch.cat([imsi_embed, day_embed, hour_embed, msgid_embed, op_embed], dim=1)
 
         # print('IMSI SIZE ', imsi_embed.size())
         # # print(' day ', x[:, 1])  # batch
@@ -193,49 +239,58 @@ class Autoencoder(nn.Module):
         # print('msgid SIZE ', msgid_embed.size())
         # print('OP SIZE ', op_embed.size())
 
-        embed_tensor = torch.cat([imsi_embed, day_embed, hour_embed, msgid_embed, op_embed], dim=1)
         # embed_tensor = embed_tensor.view(128, -1)
         # print('SIZE embed_tensor ', embed_tensor.size())
 
         return embed_tensor
 
     def forward(self, x):
-        # ----------------------------- ENCODER --------------------------------------
         # h1 is [batch_size, 10000]
         # h1 = F.relu(self.fc1(x))
         embed = self.embedding(x)
         mean, logvar = self.fc21(embed), self.fc22(embed)
-
-        # print('mean size: ', mean.size())
-        # print('logvar size: ', logvar.size())
         z = self.reparametrize(mean, logvar)
         # print('z size: ', z.size())
 
-        # ----------------------------- DECODER --------------------------------------
-        h3 = self.relu(self.fc3(z))
-        y = self.sigmoid(self.fc4(h3))
-        # print('y size: ', y.size())
-
-        return y, mean, logvar
+        return z, mean, logvar
 
     def reparametrize(self, mu, logvar):
         """
-        mu : [batch, z_dims] mean matrix
-        logvar : [batch, z_dims] variance matrix
+        Given mean and logvar returns z
+        reparameterization trick: instead of sampling from Q(z|X), sample epsilon = N(0,I)
 
+        nu, logvar: mean and log of variance of Q(z|X)
         """
-        std = logvar.mul(0.5).exp_()
-        eps = std.new(std.size()).normal_()  # torch.FloatTensor()
-        return eps.mul(std).add_(mu)
+        std = (logvar * 0.5).exp()
+        eps = torch.randn_like(std)
+        return mu + std * eps
 
 
-def loss_function_chunks(recon_x, x, mu, logvar, kld_coef=1):
+class Decoder(nn.Module):
+    def __init__(self, imsis_size=None):
+        super(Decoder, self).__init__()
+
+        self.relu = nn.ReLU()
+        self.fc3 = nn.Linear(z_dims, h1_dims)
+        self.fc4 = nn.Linear(h1_dims, imsis_size + day_size + hour_size + op_size + msgid_size)
+
+    def forward(self, z):
+        h3 = self.relu(self.fc3(z))
+        y = self.fc4(h3)
+        # print('y size: ', y.size())
+        return y
+
+
+# ----------------------------------------------- LOSS -------------------------------------------------------
+
+
+def cross_entropy_loss_per_class(recon_x, x, mu, logvar, kld_coef=1):
     global imsis_vocab_size
     # print(" ------------------ LOSS -----------------")
     # recon_x = recon_x.view(5, -1)
     # imsi, d, h, msg_id, op = torch.chunk(recon_x, 5, dim=0)
 
-    x = torch.transpose(x, 0, 1)
+    #x = torch.transpose(x, 0, 1)
 
     # print('recon_x SIZE', recon_x.size())
     # # print('IMSI CHUNK SIZE: ', imsi[0].size())
@@ -256,90 +311,48 @@ def loss_function_chunks(recon_x, x, mu, logvar, kld_coef=1):
 
     # CrossEntropy Loss needs need input size (batch, C)
     loss = nn.CrossEntropyLoss()
-    imsi_loss = loss(imsi_in, x[0])
-    day_loss = loss(day_in, x[1])
-    hour_loss = loss(hour_in, x[2])
-    msg_loss = loss(msg_id_in, x[3])
-    op_loss = loss(op_in, x[4])
+    imsi_loss = loss(imsi_in, x[:, 0])
+    day_loss = loss(day_in, x[:, 1])
+    hour_loss = loss(hour_in, x[:, 2])
+    msg_loss = loss(msg_id_in, x[:, 3])
+    op_loss = loss(op_in, x[:, 4])
 
-    BCE = imsi_loss + day_loss + hour_loss + msg_loss + op_loss
+    CE = imsi_loss + day_loss + hour_loss + msg_loss + op_loss
     losses = [imsi_loss, day_loss, hour_loss, msg_loss, op_loss]
 
-    # loss = 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
-    KLD = torch.sum(KLD_element).mul_(-0.5)
-
-    # Normalise by same number of elements as in reconstruction
-    KLD /= batch_size * D
-
-    return BCE, KLD, losses
+    kld = KLD(mu, logvar, D, batch_size)
+    return CE, kld, losses
 
 
-def loss_function(recon_x, x, mu, logvar, kld_coef=1):
+def KLD(mu, logvar, dim, batch_size):
+
     """
-    KLD is Kullback–Leibler divergence -- how much does one learned
-    distribution deviate from another, in this specific case the
-    learned distribution from the unit Gaussian
+    KLD is Kullback–Leibler divergence -- how much does one learned distribution deviate from another, in this specific
+    case the learned distribution from the unit Gaussian
 
     Parameters
     ----------
-    recon_x: reconstructed data
-    x: original data
     mu: latent mean
     logvar: latent log variance
-    kld_coef
     """
-    BCE = F.binary_cross_entropy(recon_x, x)  # reduction='sum'
 
-    # loss = 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-    KLD_element = mu.pow(2).add_(logvar.exp()).mul_(-1).add_(1).add_(logvar)
-    KLD = torch.sum(KLD_element).mul_(-0.5)
+    kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
     # Normalise by same number of elements as in reconstruction
-    KLD /= batch_size * D
-
-    return BCE, kld_coef * KLD
-
-
-def split_tensor(tensor, split_sizes, dim=0):
-    """Splits the tensor according to chunks of split_sizes.
-
-    Arguments:
-        tensor (Tensor): tensor to split.
-        split_sizes (list(int)): sizes of chunks
-        dim (int): dimension along which to split the tensor.
-    """
-    if dim < 0:
-        dim += tensor.dim()
-
-    dim_size = tensor.size(dim)
-    if dim_size != torch.sum(torch.Tensor(split_sizes)):
-        raise KeyError("Sum of split sizes exceeds tensor dim")
-
-    splits = torch.cumsum(torch.Tensor([0] + split_sizes), dim=0)[:-1]
-
-    return tuple(tensor.narrow(int(dim), int(start), int(length))
-                 for start, length in zip(splits, split_sizes))
+    kld /= batch_size * dim
+    return kld
 
 
-def save_checkpoint(checkpoint_name, epoch, autoencoder, optimizer, is_best):
-
-    state = {'epoch': epoch,
-             'autoencoder': autoencoder,
-             'optimizer': optimizer}
-    filename = 'checkpoint_' + checkpoint_name + '.pth.tar'
-    torch.save(state, filename)
-
-    # If this checkpoint is the best so far, store a copy so it doesn't get overwritten by a worse checkpoint
-    # if is_best:
-    #     torch.save(state, 'BEST_' + filename)
 
 
 # --------------------------------------------------- TRAIN -----------------------------------------------------------
 
-def train(data, ae, optimizer, epoch):
-    # toggle model to train mode
-    ae.train()
+def train(data, encoder, decoder, encoder_optimizer, decoder_optimizer, epoch):
+
+    # toggle model to train mode  (dropout and batchnorm is used)
+    encoder.train()
+    decoder.train()
+    avg_loss = 0
 
     for i in tqdm(range(0, data.size(0) - 1, 1)):
         # print('DATA SIZE: ', data.size())  # DATA SIZE:  torch.Size([88197, 128, 5])
@@ -349,23 +362,59 @@ def train(data, ae, optimizer, epoch):
         # print('X SIZE: ', x.size())  # X SIZE:  torch.Size([128, 5])
 
         # Forward pass
-        recon_batch, mu, logvar = ae.forward(x)
-        CE, KLD, losses = loss_function_chunks(recon_batch, x, mu, logvar, kld_coef)
+        z, mean, logvar = encoder.forward(x)
+        recon_batch = decoder.forward(z)
+
+        # CE + KLD Loss
+        CE, KLD, losses = cross_entropy_loss_per_class(recon_batch, x, mean, logvar, kld_coef)
         loss = CE + kld_coef * KLD
 
-        # Backward pass
-        optimizer.zero_grad()
+        # Back prop.
+        decoder_optimizer.zero_grad()
+        encoder_optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+
+        # Update weights
+        decoder_optimizer.step()
+        encoder_optimizer.step()
 
         # Get latent space z
-        z = ae.reparametrize(mu, logvar)
+        z = encoder.reparametrize(mean, logvar)
+        avg_loss += loss
 
-        # Print loss
-        # if (i + 1) % 100 == 0:
-        #    print('Epoch [%d/%d], Loss: %.4f ' % ( epoch + 1, num_epochs, loss.item()))
+    avg_loss = avg_loss / data.size(0)
 
-    return loss, CE, KLD, losses
+    return avg_loss, loss, CE, KLD, losses, z
+
+# --------------------------------------------------- VAL -----------------------------------------------------------
+
+
+def validate(data_val, encoder, decoder):
+
+    decoder.eval()  # eval mode (no dropout or batchnorm)
+    # if encoder is not None:
+    encoder.eval()
+    avg_loss = 0
+
+    # Loop over batches
+    with torch.no_grad():
+        for i in range(0, data_val.size(0) - 1, 1):
+
+            x = data_val[i, :, :].cuda()
+
+            # Forward pass
+            z, mean, logvar = encoder.forward(x)
+            recon_batch = decoder.forward(z)
+
+            # Calculate loss
+            CE, KLD, losses = cross_entropy_loss_per_class(recon_batch, x, mean, logvar, kld_coef)
+            loss_val = CE + kld_coef * KLD
+            avg_loss += loss_val
+
+    avg_loss = avg_loss / data_val.size(0)
+
+    return avg_loss
+
 
 if __name__ == "__main__":
     main()
